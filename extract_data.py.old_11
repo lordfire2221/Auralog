@@ -1,0 +1,441 @@
+"""
+AuraLog — extract_data.py
+Extraction des logs syslog depuis le data stream logs-allsystem-system.
+
+Structure réelle des documents (Filebeat 9.3.3 / syslog) :
+  - Pas de champ log.level structuré → extraction depuis message
+  - Service = agent.name (hôte Filebeat) + process parsé du message
+  - Format message : "TIMESTAMP HOSTNAME PROCESS: message content"
+"""
+
+import os
+import re
+import logging
+import argparse
+from datetime import datetime, timedelta, timezone
+from typing import Iterator
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+
+from connect_elk import ELKConnector
+
+load_dotenv()
+logger = logging.getLogger("auralog.extract")
+
+# ── Constantes ────────────────────────────────────────────────────────────────
+
+LOG_LEVEL_MAP = {
+    "TRACE": 0, "DEBUG": 1, "INFO": 2,
+    "WARN": 3, "WARNING": 3, "ERROR": 4, "CRITICAL": 5, "FATAL": 5,
+}
+
+# Mots-clés dans le message syslog → niveau de log
+SYSLOG_LEVEL_PATTERNS = [
+    (re.compile(r'\b(panic|emerg|emergency|fatal)\b',   re.I), "CRITICAL"),
+    (re.compile(r'\b(alert|crit|critical)\b',           re.I), "CRITICAL"),
+    (re.compile(r'\b(err|error|fail|failed|failure)\b', re.I), "ERROR"),
+    (re.compile(r'\b(warn|warning)\b',                  re.I), "WARNING"),
+    (re.compile(r'\b(debug)\b',                         re.I), "DEBUG"),
+]
+
+# Pattern pour extraire le process du message syslog
+# Format : "TIMESTAMP HOSTNAME PROCESS[PID]: ..." ou "TIMESTAMP HOSTNAME PROCESS: ..."
+SYSLOG_PROCESS_RE = re.compile(
+    r'^\S+\s+\S+\s+([a-zA-Z0-9_\-\.]+)(?:\[\d+\])?:'
+)
+
+SCROLL_PAGE_SIZE = int(os.getenv("ES_SCROLL_PAGE_SIZE", "1000"))
+LOOKBACK_DAYS    = int(os.getenv("AURALOG_LOOKBACK_DAYS", "30"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PARSERS SYSLOG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def parse_syslog_level(message: str) -> str:
+    """Infère le niveau de log depuis le contenu du message syslog."""
+    if not message or not isinstance(message, str):
+        return "INFO"
+    for pattern, level in SYSLOG_LEVEL_PATTERNS:
+        if pattern.search(message):
+            return level
+    return "INFO"
+
+
+def parse_syslog_process(message: str) -> str:
+    """Extrait le nom du processus depuis le message syslog."""
+    if not message or not isinstance(message, str):
+        return "unknown"
+    m = SYSLOG_PROCESS_RE.match(message.strip())
+    return m.group(1) if m else "unknown"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EXTRACTEUR PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LogExtractor:
+    """
+    Extrait et transforme les logs syslog du data stream logs-allsystem-system.
+    """
+
+    def __init__(self, connector: ELKConnector):
+        self.elk          = connector
+        self.index        = os.getenv("ES_LOG_INDEX_PATTERN", "logs-*")
+        self._service_map: dict = {}
+
+    # ── Extraction ────────────────────────────────────────────────────────────
+
+    def fetch_logs(
+        self,
+        days: int = LOOKBACK_DAYS,
+        process_filter: list[str] | None = None,
+        hosts:          list[str] | None = None,
+        extra_filters:  dict | None = None,
+    ) -> pd.DataFrame:
+        """
+        Extrait les logs syslog sur les N derniers jours.
+
+        Args:
+            days:           Fenêtre temporelle
+            process_filter: Filtrer sur des processus (ex: ["sshd", "kernel"])
+            hosts:          Filtrer sur des hôtes (ex: ["nfs-swarm"])
+            extra_filters:  Filtres DSL Elasticsearch supplémentaires
+        """
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        query = self._build_query(since, process_filter, hosts, extra_filters)
+
+        logger.info(
+            "🔍  Extraction des logs — fenêtre : %d jour(s) depuis %s",
+            days, since.strftime("%Y-%m-%d %H:%M UTC"),
+        )
+
+        records = list(self._scroll(query))
+
+        if not records:
+            logger.warning("⚠️  Aucun log trouvé pour la période demandée.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+        df = self._normalize_columns(df)
+        logger.info("✅  %d logs extraits.", len(df))
+        return df
+
+    # ── Requête DSL adaptée aux syslog Filebeat ───────────────────────────────
+
+    def _build_query(self, since, process_filter, hosts, extra_filters) -> dict:
+        must = [{"range": {"@timestamp": {"gte": since.isoformat(), "lte": "now"}}}]
+
+        if process_filter:
+            # Recherche du nom de processus dans le message
+            must.append({"bool": {"should": [
+                {"match": {"message": proc}} for proc in process_filter
+            ]}})
+
+        if hosts:
+            must.append({"terms": {"agent.name": hosts}})
+
+        if extra_filters:
+            must.append(extra_filters)
+
+        return {
+            "query":   {"bool": {"must": must}},
+            "sort":    [{"@timestamp": {"order": "asc"}}],
+            "_source": [
+                # Timestamp
+                "@timestamp",
+                # Message syslog brut (contient process + contenu)
+                "message",
+                "event.original",
+                # Hôte / agent Filebeat
+                "agent.name",
+                "agent.type",
+                "host.name",
+                "host.hostname",
+                "host.ip",
+                # Métadonnées Filebeat
+                "fileset.name",
+                "log.file.path",
+                "log.offset",
+                # Données du data stream
+                "data_stream.dataset",
+                "data_stream.namespace",
+                "event.dataset",
+                "event.module",
+                "event.timezone",
+                "service.type",
+                # Champs ECS potentiellement présents dans d'autres docs
+                "log.syslog.severity.name",
+                "log.syslog.facility.name",
+                "process.name",
+                "process.pid",
+            ],
+        }
+
+    # ── Scroll PIT (ES 8.x) ───────────────────────────────────────────────────
+
+    def _scroll(self, query: dict) -> Iterator[dict]:
+        pit    = self.elk.client.open_point_in_time(index=self.index, keep_alive="2m")
+        pit_id = pit["id"]
+
+        base_query   = {k: v for k, v in query.items() if k != "sort"}
+        search_after = None
+        total        = 0
+
+        try:
+            while True:
+                kwargs = {
+                    **base_query,
+                    "size":             SCROLL_PAGE_SIZE,
+                    "sort":             [{"@timestamp": "asc"}, {"_shard_doc": "asc"}],
+                    "pit":              {"id": pit_id, "keep_alive": "2m"},
+                    "track_total_hits": False,
+                }
+                if search_after:
+                    kwargs["search_after"] = search_after
+
+                resp   = self.elk.client.search(**kwargs)
+                pit_id = resp.get("pit_id", pit_id)
+                hits   = resp["hits"]["hits"]
+
+                if not hits:
+                    break
+
+                for hit in hits:
+                    yield hit.get("_source", {})
+
+                total       += len(hits)
+                search_after = hits[-1]["sort"]
+                logger.debug("  … %d documents extraits", total)
+
+                if len(hits) < SCROLL_PAGE_SIZE:
+                    break
+        finally:
+            try:
+                self.elk.client.close_point_in_time(id=pit_id)
+            except Exception:
+                pass
+
+    # ── Normalisation des champs syslog → colonnes internes ───────────────────
+
+    def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Mappe les champs Filebeat syslog vers les colonnes AuraLog.
+
+        Stratégie :
+          - log_level : log.syslog.severity.name si présent,
+                        sinon parsing du message (regex sur mots-clés)
+          - service   : agent.name (hôte) + process parsé du message
+          - process   : extrait du champ message (TIMESTAMP HOST PROCESS: ...)
+        """
+
+        # ── Timestamp
+        df["timestamp"] = pd.to_datetime(
+            df.get("@timestamp", pd.Series(dtype=str)),
+            utc=True, errors="coerce"
+        )
+        df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+        # ── Message (fallback sur event.original)
+        if "message" not in df.columns and "event.original" in df.columns:
+            df["message"] = df["event.original"]
+        elif "message" not in df.columns:
+            df["message"] = ""
+
+        # ── Processus (extrait du message syslog)
+        df["process"] = df["message"].apply(parse_syslog_process)
+
+        # ── Niveau de log
+        if "log.syslog.severity.name" in df.columns and \
+                df["log.syslog.severity.name"].notna().any():
+            df["log_level"] = (
+                df["log.syslog.severity.name"].str.upper().fillna("INFO")
+            )
+            logger.info("Niveau de log : champ 'log.syslog.severity.name'")
+        else:
+            # Parsing par mots-clés dans le message
+            df["log_level"] = df["message"].apply(parse_syslog_level)
+            logger.info("Niveau de log : extraction regex depuis 'message'")
+
+        # ── Service (hôte Filebeat = agent.name)
+        if "agent.name" in df.columns and df["agent.name"].notna().any():
+            df["host_agent"] = df["agent.name"].fillna("unknown")
+        elif "host.name" in df.columns:
+            df["host_agent"] = df["host.name"].fillna("unknown")
+        else:
+            df["host_agent"] = "unknown"
+
+        # Service = host_agent + process (granularité fine)
+        df["service"] = df["host_agent"] + "/" + df["process"]
+
+        # ── Renommage des colonnes restantes
+        rename_map = {
+            "host.name":            "host",
+            "host.hostname":        "host",
+            "agent.name":           "agent",
+            "agent.type":           "agent_type",
+            "log.file.path":        "log_file",
+            "fileset.name":         "fileset",
+            "event.dataset":        "event_dataset",
+            "event.module":         "event_module",
+            "data_stream.dataset":  "ds_dataset",
+            "process.name":         "process_name_ecs",
+            "process.pid":          "process_pid",
+        }
+        for src, dst in rename_map.items():
+            if src in df.columns and dst not in df.columns:
+                df.rename(columns={src: dst}, inplace=True)
+
+        # ── Nettoyage
+        for col in ["host", "agent", "fileset", "event_dataset"]:
+            if col in df.columns:
+                df[col] = df[col].fillna("unknown")
+
+        return df
+
+    # ── Inspection ────────────────────────────────────────────────────────────
+
+    def inspect_fields(self, df: pd.DataFrame, n: int = 2) -> None:
+        print("\n" + "─" * 70)
+        print(f"  {len(df.columns)} colonnes disponibles :")
+        print("─" * 70)
+        for col in sorted(df.columns):
+            vals = df[col].dropna().head(n).tolist()
+            print(f"  {col:<38} {str(vals)[:60]}")
+        print("─" * 70 + "\n")
+
+    # ── Résumé ────────────────────────────────────────────────────────────────
+
+    def summary(self, df: pd.DataFrame) -> dict:
+        if df.empty:
+            return {"status": "empty"}
+        return {
+            "total_logs":     len(df),
+            "period_start":   str(df["timestamp"].min()),
+            "period_end":     str(df["timestamp"].max()),
+            "levels":         df["log_level"].value_counts().to_dict()
+                              if "log_level" in df.columns else {},
+            "top_processes":  df["process"].value_counts().head(10).to_dict()
+                              if "process" in df.columns else {},
+            "top_hosts":      df["host_agent"].value_counts().head(5).to_dict()
+                              if "host_agent" in df.columns else {},
+            "error_rate_pct": round(
+                df["log_level"].eq("ERROR").sum() / max(len(df), 1) * 100, 2
+            ) if "log_level" in df.columns else 0,
+        }
+
+    # ── Feature Engineering ───────────────────────────────────────────────────
+
+    def build_features(self, df: pd.DataFrame, window_minutes: int = 5) -> pd.DataFrame:
+        if df.empty:
+            logger.warning("⚠️  DataFrame vide.")
+            return df
+
+        df = df.copy().set_index("timestamp")
+
+        # 1 — Encodage niveau
+        df["log_level_num"] = df["log_level"].map(LOG_LEVEL_MAP).fillna(2)
+        df["is_error"]      = df["log_level"].isin(
+            ["ERROR", "CRITICAL", "FATAL"]
+        ).astype(int)
+
+        # 2 — Taux d'erreur glissant
+        df["error_rate_1m"]  = df["is_error"].rolling("1min",  min_periods=1).sum()
+        df["error_rate_5m"]  = df["is_error"].rolling(f"{window_minutes}min", min_periods=1).sum()
+        df["total_logs_5m"]  = df["is_error"].rolling(f"{window_minutes}min", min_periods=1).count()
+        df["error_ratio_5m"] = df["error_rate_5m"] / df["total_logs_5m"].replace(0, 1)
+
+        # 3 — Vélocité
+        df["error_velocity"] = df["error_rate_1m"].diff().fillna(0)
+
+        # 4 — Encodage cyclique temporel
+        df["hour_sin"] = np.sin(2 * np.pi * df.index.hour / 24)
+        df["hour_cos"] = np.cos(2 * np.pi * df.index.hour / 24)
+        df["dow_sin"]  = np.sin(2 * np.pi * df.index.dayofweek / 7)
+        df["dow_cos"]  = np.cos(2 * np.pi * df.index.dayofweek / 7)
+
+        # 5 — Répétition de message (même processus, fenêtre 5 min)
+        if "process" in df.columns:
+            df["repeat_error"] = (
+                df.groupby("process")["is_error"]
+                .transform(lambda s: s.rolling("5min", min_periods=1).sum()) > 1
+            ).astype(int)
+        else:
+            df["repeat_error"] = 0
+
+        # 6 — Encodage processus
+        if "process" in df.columns:
+            cat              = df["process"].fillna("unknown").astype("category")
+            df["service_id"] = cat.cat.codes
+            self._service_map = dict(enumerate(cat.cat.categories))
+        else:
+            df["service_id"]  = 0
+            self._service_map = {}
+
+        df = df.reset_index()
+        logger.info(
+            "✅  Features construites — %d lignes x %d colonnes",
+            len(df), len(df.columns),
+        )
+        return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  POINT D'ENTRÉE CLI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import json
+
+    parser = argparse.ArgumentParser(description="AuraLog — Extraction syslog ELK")
+    parser.add_argument("--days",    type=int, default=LOOKBACK_DAYS,
+                        help=f"Fenêtre d'extraction en jours (défaut: {LOOKBACK_DAYS})")
+    parser.add_argument("--index",   type=str, default=None,
+                        help="Pattern d'index (ex: logs-allsystem-system)")
+    parser.add_argument("--host",    type=str, default=None,
+                        help="Filtrer sur un hôte (ex: nfs-swarm)")
+    parser.add_argument("--process", type=str, default=None,
+                        help="Filtrer sur un processus (ex: sshd)")
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("  AuraLog — Extraction des logs syslog")
+    print("=" * 60)
+    print(f"  Fenêtre  : {args.days} jour(s)")
+    print(f"  Index    : {args.index or 'logs-* (env)'}")
+    if args.host:    print(f"  Hôte     : {args.host}")
+    if args.process: print(f"  Processus: {args.process}")
+    print()
+
+    with ELKConnector() as elk:
+        extractor = LogExtractor(elk)
+
+        if args.index:
+            extractor.index = args.index
+
+        hosts   = [args.host]    if args.host    else None
+        procs   = [args.process] if args.process else None
+
+        df_raw = extractor.fetch_logs(days=args.days, hosts=hosts,
+                                      process_filter=procs)
+
+        if df_raw.empty:
+            print("⚠️  Aucune donnée trouvée.")
+        else:
+            extractor.inspect_fields(df_raw)
+
+            stats = extractor.summary(df_raw)
+            print("📊  Résumé :")
+            print(json.dumps(stats, indent=2, ensure_ascii=False, default=str))
+
+            df_feat = extractor.build_features(df_raw)
+
+            cols = [c for c in ["timestamp", "log_level", "process",
+                                 "host_agent", "error_rate_5m",
+                                 "error_velocity"] if c in df_feat.columns]
+            print(f"\n🔧  Features (10 dernières lignes) :")
+            print(df_feat[cols].tail(10).to_string(index=False))
+
+    print("\n✅  Test terminé.")

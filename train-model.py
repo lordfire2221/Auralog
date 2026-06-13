@@ -1,0 +1,500 @@
+"""
+AuraLog — train_models.py
+Entraînement des modèles ML sur les logs syslog + suivi W&B.
+
+Modèles :
+  A — Isolation Forest  : détection d'anomalies (non supervisé)
+  B — XGBoost Binary    : classification ERROR vs INFO (supervisé)
+
+Particularités des données AuraLog syslog :
+  - Dataset très déséquilibré : ~99.9% INFO, ~0.1% ERROR
+  - Pas de labels métier → is_error comme cible binaire
+  - Features temporelles cycliques (heure, jour)
+
+Usage :
+  python train_models.py                    # entraîne les deux modèles
+  python train_models.py --model iso        # Isolation Forest uniquement
+  python train_models.py --model xgb        # XGBoost uniquement
+  python train_models.py --days 30 --no-wandb
+"""
+
+import argparse
+import logging
+import os
+import pickle
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+import xgboost as xgb
+
+from connect_elk import ELKConnector
+from extract_data import LogExtractor
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("train.log", encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger("auralog.train")
+
+# ── Constantes ────────────────────────────────────────────────────────────────
+MODEL_DIR    = Path(os.getenv("AURALOG_MODEL_DIR", "./models"))
+LOOKBACK_DAYS = int(os.getenv("AURALOG_LOOKBACK_DAYS", "30"))
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# Features sans log_level_num (évite le data leakage avec is_error)
+# Le modèle doit prédire les erreurs FUTURES à partir des patterns temporels
+FEATURE_COLS = [
+    # Taux d'erreur et vélocité (patterns temporels)
+    "error_rate_1m",
+    "error_rate_5m",
+    "error_velocity",
+    "error_ratio_5m",
+    # Temporel cyclique (heure, jour de semaine)
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    # Répétition et service
+    "repeat_error",
+    "service_id",
+]
+
+# Horizon de prédiction : prédit une erreur dans les N prochaines minutes
+PREDICTION_HORIZON_MIN = int(os.getenv("AURALOG_PRED_HORIZON_MIN", "30"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  UTILITAIRES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def save_model(model, name: str) -> Path:
+    ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    path = MODEL_DIR / f"{name}_{ts}.pkl"
+    with open(path, "wb") as f:
+        pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
+    logger.info("💾  Modèle sauvegardé : %s", path)
+    return path
+
+
+def print_separator(title: str = ""):
+    width = 60
+    if title:
+        pad = (width - len(title) - 2) // 2
+        print("\n" + "─" * pad + f" {title} " + "─" * pad)
+    else:
+        print("\n" + "─" * width)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MODÈLE A — ISOLATION FOREST
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def train_isolation_forest(
+    X: np.ndarray,
+    y_true: np.ndarray,
+    wandb_run=None,
+) -> IsolationForest:
+    """
+    Entraîne un Isolation Forest pour détecter les anomalies.
+
+    Paramètres adaptés aux logs syslog :
+      - contamination calculée depuis le taux réel d'erreurs
+      - n_estimators élevé pour stabilité sur données déséquilibrées
+    """
+    print_separator("Isolation Forest")
+
+    n_errors      = int(y_true.sum())
+    n_total       = len(y_true)
+    contamination = max(0.001, min(n_errors / n_total, 0.5))
+
+    logger.info(
+        "Paramètres IF — n_samples: %d | n_errors: %d | contamination: %.4f",
+        n_total, n_errors, contamination
+    )
+
+    model = IsolationForest(
+        contamination  = contamination,
+        n_estimators   = 300,
+        max_samples    = min(10_000, n_total),
+        max_features   = 1.0,
+        bootstrap      = False,
+        random_state   = 42,
+        n_jobs         = -1,
+    )
+    model.fit(X)
+
+    # ── Métriques
+    preds         = model.predict(X)           # 1=normal, -1=anomalie
+    anomaly_flags = (preds == -1).astype(int)
+    n_detected    = int(anomaly_flags.sum())
+    pct_detected  = n_detected / n_total * 100
+
+    # Évalue vs is_error (meilleur proxy de vérité terrain disponible)
+    precision = precision_score(y_true, anomaly_flags, zero_division=0)
+    recall    = recall_score(y_true,    anomaly_flags, zero_division=0)
+    f1        = f1_score(y_true,        anomaly_flags, zero_division=0)
+
+    metrics = {
+        "iso/contamination":    contamination,
+        "iso/n_anomalies":      n_detected,
+        "iso/anomaly_rate_pct": round(pct_detected, 3),
+        "iso/precision":        round(precision, 4),
+        "iso/recall":           round(recall, 4),
+        "iso/f1":               round(f1, 4),
+    }
+
+    print(f"  Anomalies détectées : {n_detected} ({pct_detected:.2f}%)")
+    print(f"  vs is_error — Precision: {precision:.3f} | Recall: {recall:.3f} | F1: {f1:.3f}")
+
+    if wandb_run:
+        wandb_run.log(metrics)
+        # Table des anomalies détectées
+        import wandb
+        wandb_run.log({"iso/confusion": wandb.Table(
+            columns=["", "Prédit normal", "Prédit anomalie"],
+            data=[
+                ["Réel normal", int(((y_true == 0) & (anomaly_flags == 0)).sum()),
+                                int(((y_true == 0) & (anomaly_flags == 1)).sum())],
+                ["Réel erreur", int(((y_true == 1) & (anomaly_flags == 0)).sum()),
+                                int(((y_true == 1) & (anomaly_flags == 1)).sum())],
+            ]
+        )})
+
+    return model, metrics
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MODÈLE B — XGBOOST BINAIRE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def train_xgboost(
+    X: np.ndarray,
+    y: np.ndarray,
+    feature_names: list[str],
+    wandb_run=None,
+) -> xgb.XGBClassifier:
+    """
+    Entraîne un XGBoost binaire (INFO=0 vs ERROR=1).
+
+    Gestion du déséquilibre :
+      - scale_pos_weight = n_normal / n_error  (pondération automatique)
+      - eval_metric = aucpr (area under PR curve, meilleur pour déséquilibre)
+      - early stopping sur val set
+    """
+    print_separator("XGBoost — Classification ERROR vs INFO")
+
+    n_errors  = int(y.sum())
+    n_normal  = len(y) - n_errors
+    spw       = max(1.0, n_normal / max(n_errors, 1))
+
+    logger.info(
+        "XGBoost — n_normal: %d | n_errors: %d | scale_pos_weight: %.1f",
+        n_normal, n_errors, spw
+    )
+
+    # Stratified split (préserve la proportion ERROR/INFO)
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y,
+        test_size    = 0.2,
+        random_state = 42,
+        stratify     = y,
+    )
+
+    params = {
+        "n_estimators":          500,
+        "max_depth":             5,
+        "learning_rate":         0.05,
+        "subsample":             0.8,
+        "colsample_bytree":      0.8,
+        "scale_pos_weight":      spw,
+        "eval_metric":           "aucpr",
+        "early_stopping_rounds": 40,      # ← dans le constructeur (XGBoost 2.x)
+        "random_state":          42,
+        "n_jobs":                -1,
+        "tree_method":           "hist",
+    }
+
+    model = xgb.XGBClassifier(**params)
+    model.fit(
+        X_tr, y_tr,
+        eval_set = [(X_te, y_te)],
+        verbose  = False,
+    )
+
+    # ── Prédictions et seuil optimal
+    y_proba   = model.predict_proba(X_te)[:, 1]
+    # Cherche le seuil qui maximise le F1 sur la classe ERROR
+    best_f1, best_thr = 0, 0.5
+    for thr in np.arange(0.1, 0.95, 0.05):
+        y_pred_thr = (y_proba >= thr).astype(int)
+        f1_thr = f1_score(y_te, y_pred_thr, zero_division=0)
+        if f1_thr > best_f1:
+            best_f1, best_thr = f1_thr, thr
+
+    y_pred = (y_proba >= best_thr).astype(int)
+
+    # ── Métriques finales
+    prec   = precision_score(y_te, y_pred, zero_division=0)
+    rec    = recall_score(y_te,    y_pred, zero_division=0)
+    f1     = f1_score(y_te,        y_pred, zero_division=0)
+    cm     = confusion_matrix(y_te, y_pred)
+
+    metrics = {
+        "xgb/best_iteration":    model.best_iteration,
+        "xgb/best_threshold":    round(best_thr, 2),
+        "xgb/precision_error":   round(prec, 4),
+        "xgb/recall_error":      round(rec, 4),
+        "xgb/f1_error":          round(f1, 4),
+        "xgb/scale_pos_weight":  round(spw, 1),
+        "xgb/n_train":           len(X_tr),
+        "xgb/n_test":            len(X_te),
+    }
+
+    print(f"  Best iteration  : {model.best_iteration}")
+    print(f"  Seuil optimal   : {best_thr:.2f}")
+    print(f"  Precision ERROR : {prec:.3f}")
+    print(f"  Recall    ERROR : {rec:.3f}")
+    print(f"  F1        ERROR : {f1:.3f}")
+    print(f"\n  Matrice de confusion (test set) :")
+    print(f"  {'':>15} Prédit INFO  Prédit ERROR")
+    print(f"  {'Réel INFO':>15} {cm[0][0]:>11}  {cm[0][1]:>11}")
+    print(f"  {'Réel ERROR':>15} {cm[1][0]:>11}  {cm[1][1]:>11}")
+
+    # ── Feature importances
+    importances = model.feature_importances_
+    fi_sorted   = sorted(zip(feature_names, importances),
+                         key=lambda x: x[1], reverse=True)
+    print("\n  Feature importances (top 5) :")
+    for feat, imp in fi_sorted[:5]:
+        bar = "█" * int(imp * 50)
+        print(f"  {feat:<20} {bar} {imp:.4f}")
+
+    if wandb_run:
+        import wandb
+        wandb_run.log(metrics)
+        wandb_run.log({"xgb/confusion": wandb.Table(
+            columns=["", "Prédit INFO", "Prédit ERROR"],
+            data=[
+                ["Réel INFO",  int(cm[0][0]), int(cm[0][1])],
+                ["Réel ERROR", int(cm[1][0]), int(cm[1][1])],
+            ]
+        )})
+        wandb_run.log({"xgb/feature_importance": wandb.Table(
+            columns=["feature", "importance"],
+            data=[[f, float(i)] for f, i in fi_sorted]
+        )})
+        # Courbe precision-recall (sampled)
+        pr_data = []
+        for thr in np.arange(0.05, 1.0, 0.05):
+            yp = (y_proba >= thr).astype(int)
+            pr_data.append([
+                round(float(thr), 2),
+                round(float(precision_score(y_te, yp, zero_division=0)), 4),
+                round(float(recall_score(y_te, yp, zero_division=0)), 4),
+            ])
+        wandb_run.log({"xgb/pr_curve": wandb.Table(
+            columns=["threshold", "precision", "recall"],
+            data=pr_data
+        )})
+
+    # Sauvegarde du seuil optimal dans le modèle
+    model.best_threshold_ = best_thr
+    return model, metrics
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PIPELINE D'ENTRAÎNEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_training(args):
+    # ── W&B setup
+    wandb_run = None
+    if not args.no_wandb:
+        try:
+            from weight_biases import WandBManager
+            mgr = WandBManager()
+            wandb_run = mgr.start_run(
+                run_name   = f"train_{args.model}_{datetime.utcnow():%Y%m%d_%H%M}",
+                model_type = args.model,
+                config     = {
+                    "days":         args.days,
+                    "model":        args.model,
+                    "feature_cols": FEATURE_COLS,
+                    "index":        "logs-allsystem-system",
+                },
+                tags  = ["syslog", "auralog", args.model],
+                notes = f"Entraînement sur {args.days} jours de logs syslog",
+            )
+        except Exception as e:
+            logger.warning("⚠️  W&B non disponible (%s) — mode offline", e)
+            wandb_run = None
+
+    # ── Extraction des données
+    print_separator("Extraction des données")
+    with ELKConnector() as elk:
+        extractor = LogExtractor(elk)
+        if args.index:
+            extractor.index = args.index
+
+        # Agrégations — scalable à n'importe quel volume
+        logger.info("📊  Extraction via agrégations ELK...")
+        df_raw = extractor.fetch_aggregated(days=args.days)
+
+    if df_raw.empty:
+        logger.error("❌  Aucune donnée extraite — pipeline arrêté.")
+        sys.exit(1)
+
+    df = extractor.build_features(df_raw)
+
+    # Vérifie que les features sont disponibles
+    missing = [c for c in FEATURE_COLS if c not in df.columns]
+    if missing:
+        logger.error("Colonnes manquantes : %s", missing)
+        sys.exit(1)
+
+    X        = df[FEATURE_COLS].fillna(0).values
+    y_now    = df["is_error"].values.astype(int)   # pour Isolation Forest (temps réel)
+
+    # ── Cible décalée pour XGBoost (prédictif : erreur dans les N prochaines min)
+    df_sorted  = df.sort_values("timestamp").copy()
+    timestamps = df_sorted["timestamp"].values
+    errors     = df_sorted["is_error"].values.astype(int)
+    horizon    = np.timedelta64(PREDICTION_HORIZON_MIN, "m")
+
+    y_future = np.zeros(len(df_sorted), dtype=int)
+    for i in range(len(df_sorted)):
+        window = (timestamps > timestamps[i]) & \
+                 (timestamps <= timestamps[i] + horizon)
+        if errors[window].sum() > 0:
+            y_future[i] = 1
+
+    n_future = int(y_future.sum())
+    logger.info(
+        "Cible prédictive +%dmin — points avec erreur future : %d (%.2f%%)",
+        PREDICTION_HORIZON_MIN, n_future, n_future / len(y_future) * 100
+    )
+    stats = extractor.summary(df_raw)
+
+    print(f"  Logs extraits    : {stats['total_logs']:,}")
+    print(f"  Période          : {stats['period_start'][:10]} → {stats['period_end'][:10]}")
+    print(f"  Taux d'erreurs   : {stats['error_rate_pct']}%")
+    print(f"  Features         : {len(FEATURE_COLS)} colonnes")
+
+    if wandb_run:
+        wandb_run.config.update({
+            "n_samples":      len(df),
+            "n_errors":       int(y_now.sum()),
+            "error_rate_pct": stats["error_rate_pct"],
+        })
+
+    all_metrics = {}
+    saved_paths = {}
+
+    # ── Modèle A — Isolation Forest (anomalie temps réel sur is_error)
+    if args.model in ("iso", "both"):
+        iso_model, iso_metrics = train_isolation_forest(X, y_now, wandb_run)
+        all_metrics.update(iso_metrics)
+        saved_paths["isolation_forest"] = save_model(iso_model, "isolation_forest")
+
+        if wandb_run:
+            try:
+                import wandb
+                artifact = wandb.Artifact("isolation_forest", type="model",
+                    metadata={**iso_metrics, "feature_cols": FEATURE_COLS,
+                              "target": "is_error_realtime"})
+                artifact.add_file(str(saved_paths["isolation_forest"]))
+                wandb_run.log_artifact(artifact)
+            except Exception as e:
+                logger.warning("Artifact W&B non sauvegardé : %s", e)
+
+    # ── Modèle B — XGBoost (prédictif : erreur dans les N prochaines min)
+    if args.model in ("xgb", "both"):
+        xgb_model, xgb_metrics = train_xgboost(X, y_future, FEATURE_COLS, wandb_run)
+        all_metrics.update(xgb_metrics)
+        saved_paths["xgboost"] = save_model(xgb_model, "xgboost")
+
+        # Sauvegarde aussi le LabelEncoder et feature_cols pour l'inférence
+        meta = {
+            "feature_cols":   FEATURE_COLS,
+            "best_threshold": xgb_model.best_threshold_,
+        }
+        meta_path = MODEL_DIR / "model_meta.pkl"
+        with open(meta_path, "wb") as f:
+            pickle.dump(meta, f)
+
+        if wandb_run:
+            try:
+                import wandb
+                artifact = wandb.Artifact("xgboost_classifier", type="model",
+                    metadata={**xgb_metrics, "feature_cols": FEATURE_COLS,
+                              "threshold": xgb_model.best_threshold_})
+                artifact.add_file(str(saved_paths["xgboost"]))
+                artifact.add_file(str(meta_path))
+                wandb_run.log_artifact(artifact)
+            except Exception as e:
+                logger.warning("Artifact W&B non sauvegardé : %s", e)
+
+    # ── Résumé final
+    print_separator("Résumé")
+    for key, val in all_metrics.items():
+        print(f"  {key:<35} {val}")
+    print()
+    for name, path in saved_paths.items():
+        print(f"  💾  {name:<25} → {path}")
+
+    if wandb_run:
+        try:
+            import wandb
+            wandb.finish()
+            print(f"\n  📊  Dashboard W&B : https://wandb.ai")
+        except Exception:
+            pass
+
+    return all_metrics
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CLI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="AuraLog — Entraînement des modèles ML"
+    )
+    parser.add_argument("--model",    choices=["iso", "xgb", "both"],
+                        default="both", help="Modèle à entraîner (défaut: both)")
+    parser.add_argument("--days",     type=int, default=LOOKBACK_DAYS,
+                        help=f"Fenêtre d'extraction en jours (défaut: {LOOKBACK_DAYS})")
+    parser.add_argument("--index",    type=str, default=None,
+                        help="Pattern d'index ELK")
+    parser.add_argument("--no-wandb", action="store_true",
+                        help="Désactive le tracking W&B")
+    args = parser.parse_args()
+
+    print("╔" + "═" * 58 + "╗")
+    print("║       AuraLog — Entraînement des modèles ML              ║")
+    print("╚" + "═" * 58 + "╝")
+    print(f"\n  Modèle(s) : {args.model} | Fenêtre : {args.days}j | W&B : {'off' if args.no_wandb else 'on'}\n")
+
+    run_training(args)
+    print("\n✅  Entraînement terminé.")

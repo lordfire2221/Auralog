@@ -1,0 +1,24 @@
+# AuraLog — Dépendances Python
+# Installation : pip install -r requirements.txt
+
+# Elasticsearch 8.x (doit correspondre à votre version ES)
+elasticsearch==8.15.0
+
+# Data & ML
+pandas>=2.0.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+xgboost>=2.0.0
+prophet>=1.1.5
+cmdstanpy>=1.2.0          # backend Stan de Prophet
+# MLOps
+wandb>=0.17.0
+echo "AURALOG_PRED_HORIZON_MIN=30" >> .env
+# Utilitaires
+python-dotenv>=1.0.0
+
+# streamlit
+streamlit>=1.35.0
+plotly>=5.22.0
+python-dotenv>=1.0.0
+

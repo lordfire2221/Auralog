@@ -1,0 +1,399 @@
+"""
+AuraLog — extract_data.py
+Extraction des logs depuis le data stream Elasticsearch logs-allsystem-system
+et construction des features pour les modèles ML.
+
+Pipeline :
+  ELK (logs-*)  →  fetch_logs()  →  _normalize_columns()  →  build_features()
+"""
+
+import os
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Iterator
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+
+from connect_elk import ELKConnector
+
+load_dotenv()
+
+logger = logging.getLogger("auralog.extract")
+
+LOG_LEVEL_MAP = {
+    "TRACE":    0,
+    "DEBUG":    1,
+    "INFO":     2,
+    "WARN":     3,
+    "WARNING":  3,
+    "ERROR":    4,
+    "CRITICAL": 5,
+    "FATAL":    5,
+}
+
+SCROLL_PAGE_SIZE = int(os.getenv("ES_SCROLL_PAGE_SIZE", "1000"))
+LOOKBACK_DAYS    = int(os.getenv("AURALOG_LOOKBACK_DAYS", "30"))
+
+
+class LogExtractor:
+    """
+    Extrait et transforme les logs du data stream logs-* en DataFrame ML.
+    """
+
+    def __init__(self, connector: ELKConnector):
+        self.elk   = connector
+        self.index = os.getenv("ES_LOG_INDEX_PATTERN", "logs-*")
+        self._service_map: dict = {}
+
+    # ── Extraction ────────────────────────────────────────────────────────────
+
+    def fetch_logs(
+        self,
+        days: int = LOOKBACK_DAYS,
+        level_filter: list[str] | None = None,
+        services:     list[str] | None = None,
+        extra_filters: dict | None = None,
+    ) -> pd.DataFrame:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        query = self._build_query(since, level_filter, services, extra_filters)
+
+        logger.info(
+            "🔍  Extraction des logs — fenêtre : %d jour(s) depuis %s",
+            days, since.strftime("%Y-%m-%d %H:%M UTC"),
+        )
+
+        records = list(self._scroll(query))
+
+        if not records:
+            logger.warning("⚠️  Aucun log trouvé pour la période demandée.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+        df = self._normalize_columns(df)
+        logger.info("✅  %d logs extraits.", len(df))
+        return df
+
+    # ── Requête DSL ───────────────────────────────────────────────────────────
+
+    def _build_query(self, since, level_filter, services, extra_filters) -> dict:
+        must = [{"range": {"@timestamp": {"gte": since.isoformat(), "lte": "now"}}}]
+
+        if level_filter:
+            must.append({"bool": {"should": [
+                {"terms": {"log.level":                [v.lower() for v in level_filter]}},
+                {"terms": {"log.syslog.severity.name": [v.lower() for v in level_filter]}},
+                {"terms": {"event.severity":           level_filter}},
+            ]}})
+
+        if services:
+            must.append({"bool": {"should": [
+                {"terms": {"service.name": services}},
+                {"terms": {"process.name": services}},
+                {"terms": {"agent.name":   services}},
+            ]}})
+
+        if extra_filters:
+            must.append(extra_filters)
+
+        return {
+            "query":   {"bool": {"must": must}},
+            "sort":    [{"@timestamp": {"order": "asc"}}],
+            "_source": [
+                "@timestamp",
+                # Niveau de log (ECS — plusieurs champs possibles)
+                "log.level",
+                "log.syslog.severity.name",
+                "event.severity",
+                # Message
+                "message",
+                # Service / processus
+                "service.name",
+                "process.name",
+                "process.pid",
+                "agent.name",
+                "agent.type",
+                "event.dataset",
+                # Hôte
+                "host.name",
+                "host.hostname",
+                "host.ip",
+                # Événement
+                "event.category",
+                "event.outcome",
+                "event.action",
+                "event.kind",
+                "event.type",
+                # Erreur
+                "error.type",
+                "error.message",
+                "error.code",
+                # Kubernetes
+                "kubernetes.container.name",
+                "kubernetes.namespace",
+                "kubernetes.pod.name",
+                # Fichier source
+                "log.file.path",
+            ],
+        }
+
+    # ── Scroll PIT (ES 8.x) ───────────────────────────────────────────────────
+
+    def _scroll(self, query: dict) -> Iterator[dict]:
+        pit = self.elk.client.open_point_in_time(index=self.index, keep_alive="2m")
+        pit_id = pit["id"]
+
+        base_query = {k: v for k, v in query.items() if k != "sort"}
+        total_fetched = 0
+        search_after  = None
+
+        try:
+            while True:
+                search_kwargs = {
+                    **base_query,
+                    "size":             SCROLL_PAGE_SIZE,
+                    "sort":             [{"@timestamp": "asc"}, {"_shard_doc": "asc"}],
+                    "pit":              {"id": pit_id, "keep_alive": "2m"},
+                    "track_total_hits": False,
+                }
+                if search_after:
+                    search_kwargs["search_after"] = search_after
+
+                resp   = self.elk.client.search(**search_kwargs)
+                pit_id = resp.get("pit_id", pit_id)
+                hits   = resp["hits"]["hits"]
+
+                if not hits:
+                    break
+
+                for hit in hits:
+                    yield hit.get("_source", {})
+
+                total_fetched += len(hits)
+                logger.debug("  … %d documents extraits", total_fetched)
+                search_after = hits[-1]["sort"]
+
+                if len(hits) < SCROLL_PAGE_SIZE:
+                    break
+        finally:
+            try:
+                self.elk.client.close_point_in_time(id=pit_id)
+            except Exception:
+                pass
+
+    # ── Normalisation ECS → colonnes internes ─────────────────────────────────
+
+    def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Mappe les champs ECS du data stream logs-allsystem-system
+        vers les colonnes internes AuraLog.
+
+        Résolution par priorité :
+          log_level : log.level > log.syslog.severity.name > event.severity
+          service   : service.name > process.name > agent.name > event.dataset > host.name
+        """
+        # — Niveau de log
+        for cand in ["log.level", "log.syslog.severity.name", "event.severity"]:
+            if cand in df.columns and df[cand].notna().any():
+                df["log_level"] = df[cand].astype(str).str.upper().replace("NAN", "UNKNOWN")
+                logger.info("Champ niveau utilisé : '%s'", cand)
+                break
+        else:
+            df["log_level"] = "UNKNOWN"
+            logger.warning("⚠️  Aucun champ de niveau de log trouvé dans les données.")
+
+        # — Service
+        for cand in ["service.name", "process.name", "agent.name",
+                     "event.dataset", "kubernetes.container.name", "host.name"]:
+            if cand in df.columns and df[cand].notna().any():
+                df["service"] = df[cand].fillna("unknown")
+                logger.info("Champ service utilisé : '%s'", cand)
+                break
+        else:
+            df["service"] = "unknown"
+
+        # — Renommage standard
+        rename_map = {
+            "@timestamp":           "timestamp",
+            "host.name":            "host",
+            "host.hostname":        "host",
+            "event.category":       "event_category",
+            "event.outcome":        "event_outcome",
+            "event.action":         "event_action",
+            "event.kind":           "event_kind",
+            "event.dataset":        "event_dataset",
+            "error.type":           "error_type",
+            "error.message":        "error_message",
+            "error.code":           "error_code",
+            "log.file.path":        "log_file",
+            "process.name":         "process_name",
+            "process.pid":          "process_pid",
+            "kubernetes.namespace": "k8s_namespace",
+            "kubernetes.pod.name":  "k8s_pod",
+        }
+        cols = {k: v for k, v in rename_map.items()
+                if k in df.columns and v not in df.columns}
+        df = df.rename(columns=cols)
+
+        # — Timestamp
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+        # — Valeurs manquantes
+        for col in ["service", "host", "event_category", "event_outcome",
+                    "event_action", "error_type", "error_message"]:
+            if col in df.columns:
+                df[col] = df[col].fillna("unknown")
+
+        return df
+
+    # ── Inspection des champs ─────────────────────────────────────────────────
+
+    def inspect_fields(self, df: pd.DataFrame, n_samples: int = 3) -> None:
+        """Affiche les colonnes réelles et leurs valeurs exemples."""
+        print("\n" + "─" * 65)
+        print(f"  Colonnes disponibles ({len(df.columns)}) :")
+        print("─" * 65)
+        for col in sorted(df.columns):
+            vals = df[col].dropna().head(n_samples).tolist()
+            print(f"  {col:<38} ex: {vals}")
+        print("─" * 65 + "\n")
+
+    def _detect_level_column(self, df: pd.DataFrame) -> str | None:
+        for col in ["log_level", "level", "severity", "log.level",
+                    "event.severity", "loglevel"]:
+            if col in df.columns:
+                return col
+        known = {"ERROR", "WARN", "WARNING", "INFO", "DEBUG", "CRITICAL"}
+        for col in df.select_dtypes(include="object").columns:
+            if set(df[col].dropna().str.upper().unique()) & known:
+                return col
+        return None
+
+    def _detect_service_column(self, df: pd.DataFrame) -> str | None:
+        for col in ["service", "service_name", "service.name", "app",
+                    "process_name", "agent.name", "event_dataset"]:
+            if col in df.columns:
+                return col
+        return None
+
+    # ── Feature Engineering ───────────────────────────────────────────────────
+
+    def build_features(self, df: pd.DataFrame, window_minutes: int = 5) -> pd.DataFrame:
+        if df.empty:
+            logger.warning("⚠️  DataFrame vide, build_features ignoré.")
+            return df
+
+        df = df.copy().set_index("timestamp")
+
+        level_col   = self._detect_level_column(df)
+        service_col = self._detect_service_column(df)
+
+        # 1 — Encodage niveau
+        if level_col:
+            df["log_level_num"] = df[level_col].str.upper().map(LOG_LEVEL_MAP).fillna(2)
+            df["is_error"]      = df[level_col].str.upper().isin(
+                ["ERROR", "CRITICAL", "FATAL"]
+            ).astype(int)
+            if level_col != "log_level":
+                df["log_level"] = df[level_col].str.upper()
+        else:
+            df["log_level_num"] = 2
+            df["is_error"]      = 0
+            df["log_level"]     = "UNKNOWN"
+
+        # 2 — Taux d'erreur glissant
+        df["error_rate_1m"]  = df["is_error"].rolling("1min",  min_periods=1).sum()
+        df["error_rate_5m"]  = df["is_error"].rolling(f"{window_minutes}min", min_periods=1).sum()
+        df["total_logs_5m"]  = df["is_error"].rolling(f"{window_minutes}min", min_periods=1).count()
+        df["error_ratio_5m"] = df["error_rate_5m"] / df["total_logs_5m"].replace(0, 1)
+
+        # 3 — Vélocité
+        df["error_velocity"] = df["error_rate_1m"].diff().fillna(0)
+
+        # 4 — Encodage cyclique temporel
+        df["hour_sin"] = np.sin(2 * np.pi * df.index.hour / 24)
+        df["hour_cos"] = np.cos(2 * np.pi * df.index.hour / 24)
+        df["dow_sin"]  = np.sin(2 * np.pi * df.index.dayofweek / 7)
+        df["dow_cos"]  = np.cos(2 * np.pi * df.index.dayofweek / 7)
+
+        # 5 — Répétition de message
+        if "message" in df.columns:
+            df["repeat_error"] = (
+                df.groupby("message")["is_error"]
+                .transform(lambda s: s.rolling("5min", min_periods=1).sum()) > 1
+            ).astype(int)
+        else:
+            df["repeat_error"] = 0
+
+        # 6 — Encodage service
+        if service_col:
+            cat = df[service_col].fillna("unknown").astype("category")
+            df["service_id"]  = cat.cat.codes
+            self._service_map = dict(enumerate(cat.cat.categories))
+            if service_col != "service":
+                df["service"] = df[service_col]
+        else:
+            df["service_id"]  = 0
+            df["service"]     = "unknown"
+            self._service_map = {}
+
+        df = df.reset_index()
+        logger.info("✅  Features construites — %d lignes x %d colonnes", len(df), len(df.columns))
+        return df
+
+    # ── Résumé statistique ────────────────────────────────────────────────────
+
+    def summary(self, df: pd.DataFrame) -> dict:
+        if df.empty:
+            return {"status": "empty"}
+
+        level_counts   = df["log_level"].value_counts().to_dict() if "log_level" in df.columns else {}
+        service_counts = df["service"].value_counts().head(10).to_dict() if "service" in df.columns else {}
+
+        return {
+            "total_logs":     len(df),
+            "period_start":   str(df["timestamp"].min()) if "timestamp" in df.columns else None,
+            "period_end":     str(df["timestamp"].max()) if "timestamp" in df.columns else None,
+            "levels":         level_counts,
+            "top_services":   service_counts,
+            "error_rate_pct": round(level_counts.get("ERROR", 0) / max(len(df), 1) * 100, 2),
+        }
+
+
+# ── Test ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import json
+
+    print("=" * 60)
+    print("  AuraLog — Test d'extraction des données")
+    print("=" * 60)
+
+    with ELKConnector() as elk:
+        extractor = LogExtractor(elk)
+
+        df_raw = extractor.fetch_logs(days=7)
+
+        if df_raw.empty:
+            print("\n⚠️  Aucune donnée — vérifiez votre index ELK.")
+        else:
+            # Affiche les vrais champs disponibles
+            extractor.inspect_fields(df_raw)
+
+            stats = extractor.summary(df_raw)
+            print("📊  Résumé :")
+            print(json.dumps(stats, indent=2, ensure_ascii=False, default=str))
+
+            df_feat = extractor.build_features(df_raw)
+
+            display_cols = [c for c in [
+                "timestamp", "log_level", "service",
+                "error_rate_5m", "error_velocity", "hour_sin"
+            ] if c in df_feat.columns]
+
+            print(f"\n🔧  Features (10 dernières lignes) :")
+            print(df_feat[display_cols].tail(10).to_string(index=False))
+
+    print("\n✅  Test terminé.")

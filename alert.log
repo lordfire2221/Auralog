@@ -1,0 +1,24 @@
+2026-06-12 15:57:06,182 [INFO] auralog.main — 📦  Modèle chargé : isolation_forest_20260612_134527.pkl
+2026-06-12 15:57:06,186 [INFO] auralog.main — 📦  Modèle chargé : xgboost_20260612_134527.pkl
+2026-06-12 15:57:06,186 [WARNING] auralog.elk — ⚠️  Vérification SSL désactivée — mode DEV uniquement
+2026-06-12 15:57:06,221 [INFO] elastic_transport.transport — GET https://elastic.fares.top:443/ [status:200 duration:0.006s]
+2026-06-12 15:57:06,222 [INFO] auralog.elk — ✅  Connecté à Elasticsearch — https://elastic.fares.top
+2026-06-12 15:57:06,222 [INFO] auralog.extract — 📊  Extraction agrégée — fenêtre : 1 j | intervalle : 1m | depuis 2026-06-11 13:57 UTC
+2026-06-12 15:57:06,504 [INFO] elastic_transport.transport — POST https://elastic.fares.top:443/logs-*/_search [status:200 duration:0.282s]
+2026-06-12 15:57:06,519 [INFO] auralog.extract — ✅  1440 buckets extraits (2026-06-11 13:57 → 2026-06-12 13:56)
+2026-06-12 15:57:06,520 [INFO] auralog.elk — 🔌  Connexion Elasticsearch fermée.
+2026-06-12 15:57:06,542 [INFO] auralog.extract — ✅  Features construites — 1440 lignes x 22 colonnes
+2026-06-12 15:57:06,629 [INFO] auralog.alert — ✅  Aucune alerte à envoyer — situation normale.
+============================================================
+  AuraLog — Mode: alert | Fenêtre: 1j | Horizon: +30min
+============================================================
+
+📊  1,440 buckets analysés
+🚨  1 incident(s) détecté(s)
+🔮  0 prédiction(s) préventive(s)
+
+📨  0 alerte(s) envoyée(s)
+
+============================================================
+  ✅  Terminé — 2026-06-12 13:57 UTC
+============================================================
